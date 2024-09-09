@@ -3,7 +3,6 @@
 #include <chrono>
 
 ThreadPool threads;
-std::mutex m;
 
 void myFunction(void) {
     std::cout << "Just started\n";
@@ -16,12 +15,9 @@ int parallel_fib(int n) {
         return n;
     }
     else {
-        auto x = threads.enqueue(parallel_fib, n-1);
+        auto x = threads.enqueue(std::bind(parallel_fib, n - 1), n - 1);
         int y = parallel_fib(n-2);
         int x_res = x.get();
-        m.lock();
-        std::cout << "finished for " << n << std::endl;
-        m.unlock();
         return x_res + y;
     }
 }
@@ -31,8 +27,7 @@ int main() {
 
     int n = 0;
     std::cin >> n;
-    auto x = threads.enqueue(parallel_fib, n);
-    std::cout << x.get() << std::endl;
+    std::cout << parallel_fib(n) << std::endl;
     
     return 0;
 }

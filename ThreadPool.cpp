@@ -5,19 +5,23 @@ ThreadPool::ThreadPool() {
 	this->terminate = false;
 	for(int i=0; i<threads; i++) {
 		workers.emplace_back([this] {
-			while(true) {
-				std::function<void()> task;
-				{
-					std::unique_lock<std::mutex> lock(queueLock);
-					cv.wait(lock, [this] { return (terminate || !tasks.empty()); });
-					if(terminate || tasks.empty()) {
-						return;
-					}
-					task = std::move(tasks.top());
-					tasks.pop();
-				}
-				task();
-			}
+			std::unique_lock<std::mutex> lock(queueLock);
+
+			startupCv.wait(lock, [this] { return start || terminate; }); // unless told to stop, or the whole process to terminate, wait!
+
+			// keep continuously running up the queue priority list
+			while (true) {
+                std::function<void()> task;
+                cv.wait(lock, [this] { return terminate || !tasks.empty(); });
+                if (terminate && tasks.empty()) {
+                    return;
+                }
+                task = std::move(tasks.top().second);
+                tasks.pop();
+                lock.unlock();
+                task();
+                lock.lock();
+            }
 		});
 	}
 }
