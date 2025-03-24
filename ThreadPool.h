@@ -3,66 +3,68 @@
 #include <iostream>
 #include <vector>
 #include <thread>
-#include <string>
-#include <future>
-#include <vector>
 #include <queue>
-#include <functional>
+#include <mutex>
 #include <condition_variable>
-
-struct Compare {
-    bool operator()(const std::pair<int, std::function<void()>>& lhs,
-                    const std::pair<int, std::function<void()>>& rhs) const {
-        // Min-heap: prioritize lower int values
-        return lhs.first > rhs.first;
-    }
-};
+#include <future>
+#include <functional>
 
 class ThreadPool {
-private:
-	int threads;
-	std::vector<std::thread> workers;
-	 std::priority_queue<
-        std::pair<int, std::function<void()>>,
-        std::vector<std::pair<int, std::function<void()>>>,
-		Compare
-    > tasks;
-
-	std::mutex queueLock;
-	std::condition_variable cv;
-    std::condition_variable startupCv;
-	bool terminate;
-	bool start;
 public:
-	static ThreadPool* getInstance();
-
-	template<class F, class... Args>
-	auto enqueue(F&& f, Args&&... args, int priority = 1) -> std::future<typename std::result_of<F(Args...)>::type> {
-		using returnType = typename std::result_of<F(Args...)>::type;
-		// std::cout << "enqueueing priority: " << priority << "\n";
-		auto task = std::make_shared<std::packaged_task<returnType()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-
-		std::future<returnType> res = task->get_future();
-		{
-			std::unique_lock<std::mutex> lock(queueLock);
-
-			// Don't allow enqueueing after stopping / destructing the pool
-			if (terminate)
-				throw std::runtime_error("enqueue on stopped ThreadPool");
-			
-        	tasks.emplace(priority, [task]() { (*task)(); });
-
-			// If task with priority 1 is enqueued, signal the threads to start
-            if (priority <= 2) {
-                start = true;
-                startupCv.notify_all(); // notify all waiting workers (which are doing nothing till this point)
-            }
+	ThreadPool(size_t numThreads) : stop_(false) {
+		for (size_t i = 0; i < numThreads; ++i) {
+			workers_.emplace_back([this] {
+				while (true) {
+					std::function<void()> task;
+					{
+						std::unique_lock<std::mutex> lock(queueMutex_);
+						condition_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+						if (stop_ && tasks_.empty()) {
+							return;
+						}
+						task = std::move(tasks_.front());
+						tasks_.pop();
+					}
+					task();
+				}
+			});
 		}
-		cv.notify_one();
+	}
+
+	~ThreadPool() {
+		{
+			std::unique_lock<std::mutex> lock(queueMutex_);
+			stop_ = true;
+		}
+		condition_.notify_all();
+		for (std::thread& worker : workers_) {
+			worker.join();
+		}
+	}
+
+	template <typename F, typename... Args>
+	auto enqueue(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type> {
+		using return_type = typename std::result_of<F(Args...)>::type;
+
+		auto task = std::make_shared<std::packaged_task<return_type()>>(
+			std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+
+		std::future<return_type> res = task->get_future();
+		{
+			std::unique_lock<std::mutex> lock(queueMutex_);
+			if (stop_) {
+				throw std::runtime_error("enqueue on stopped ThreadPool");
+			}
+			tasks_.emplace([task]() { (*task)(); });
+		}
+		condition_.notify_one();
 		return res;
 	}
 
-	ThreadPool();
-	void finish();
-	~ThreadPool();
+private:
+	std::vector<std::thread> workers_;
+	std::queue<std::function<void()>> tasks_;
+	std::mutex queueMutex_;
+	std::condition_variable condition_;
+	bool stop_;
 };

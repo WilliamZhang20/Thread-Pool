@@ -1,33 +1,27 @@
 #include <iostream>
 #include "FastMatrix.h"
-#include <chrono>
 
-ThreadPool threads;
-
-void myFunction(void) {
-    std::cout << "Just started\n";
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    std::cout << "It's done\n";
-}
-
-int parallel_fib(int n) {
-    if(n <= 1) {
+long long fibonacci(int n) {
+    if (n <= 1) {
         return n;
     }
-    else {
-        auto x = threads.enqueue(std::bind(parallel_fib, n - 1), n - 1);
-        int y = parallel_fib(n-2);
-        int x_res = x.get();
-        return x_res + y;
-    }
+    return fibonacci(n - 1) + fibonacci(n - 2);
 }
 
 int main() {
-  	// Enqueueing works just like regular std::thread library, just different methods
+    ThreadPool pool(std::thread::hardware_concurrency()); // Use available cores
+    int n = 40; // Fibonacci number to calculate
+    std::future<long long> result = pool.enqueue(fibonacci, n);
 
-    int n = 0;
-    std::cin >> n;
-    std::cout << parallel_fib(n) << std::endl;
-    
+    std::cout << "Fibonacci(" << n << ") = " << result.get() << std::endl;
+
+    //Example of multiple fibonacci calculations.
+    std::vector<std::future<long long>> results;
+    for(int i = 30; i < 40; ++i){
+        results.push_back(pool.enqueue(fibonacci, i));
+    }
+    for(int i = 0; i < results.size(); ++i){
+        std::cout << "Fibonacci("<<i+30<<") = " << results[i].get() << std::endl;
+    }
     return 0;
 }
