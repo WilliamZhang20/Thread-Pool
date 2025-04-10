@@ -9,8 +9,9 @@ ThreadPool global_pool(std::thread::hardware_concurrency()); // only 1 pool shou
 template<typename T>
 struct AsyncTask {
     struct promise_type {
-        T value;
-        std::exception_ptr exception;
+        T value; // hold return value when ready
+        std::exception_ptr exception; // hold exceptions returned
+        std::promise<void> ready; // indicate when task is finished
 
         AsyncTask get_return_object() {
             return AsyncTask{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -18,7 +19,10 @@ struct AsyncTask {
 
         // coroutine does not suspend at start, but always at end
         std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; } 
+        std::suspend_always final_suspend() noexcept { 
+            ready.set_value(); // set to done
+            return {}; 
+        } 
 
         void return_value(T v) { value = v; }
         void unhandled_exception() { exception = std::current_exception(); }
@@ -31,11 +35,8 @@ struct AsyncTask {
     ~AsyncTask() { if (coro) coro.destroy(); }
 
     T get() { // called at waiting for completion of the coroutine
-        while (!coro.done()) {
-            // yield CPU until ready
-            std::this_thread::yield();
-        }
-        if (coro.promise().exception) std::rethrow_exception(coro.promise().exception);
+        coro.promise().ready.get_future().wait(); // wait for promise to be fulfilled
+        if (coro.promise().exception) std::rethrow_exception(coro.promise().exception); // if exception, throw it
         return coro.promise().value;
     }
 
