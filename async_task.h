@@ -49,11 +49,14 @@ struct AsyncTask {
 
             bool await_ready() const noexcept { return coro.done(); }
 
-            void await_suspend(std::coroutine_handle<> awaiting) { // if coroutine is not done push to thread pool for later computation
+            void await_suspend(std::coroutine_handle<> awaiting) {
                 global_pool.enqueue([coro = this->coro, awaiting]() mutable {
-                    // resume the awaiting coroutine
-                    coro.resume();
-                    awaiting.resume();
+                    if (!coro.done()) {
+                        coro.resume();
+                    }
+                    if (awaiting) {
+                        awaiting.resume();
+                    }
                 });
             }
 
