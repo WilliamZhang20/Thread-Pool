@@ -22,7 +22,7 @@ struct AsyncTask {
         std::suspend_always final_suspend() noexcept { 
             ready.set_value(); // set to done
             return {}; 
-        } 
+        }
 
         void return_value(T v) { value = v; }
         void unhandled_exception() { exception = std::current_exception(); }
