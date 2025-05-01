@@ -14,24 +14,9 @@ public:
     ~ThreadPool();
 
     template<typename F, typename... Args>
-    auto enqueue(F&& f, Args&&... args) -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>> {
-        using return_type = std::invoke_result_t<F, Args...>;
+    auto enqueue(F&& f, Args&&... args) -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>;
 
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-        );
-
-        auto wrapper = [task]() { (*task)(); };
-        
-        size_t i = std::hash<std::thread::id>{}(std::this_thread::get_id()) % queues_.size();
-        {
-            std::unique_lock<std::mutex> lock(queueMutex_);
-            if (stop_) throw std::runtime_error("enqueue on stopped ThreadPool");
-            queues_[i].push_back(std::move(wrapper));
-        }
-        condition_.notify_one();
-        return task->get_future();
-    }
+    int size();
 
 private:
     std::vector<std::thread> workers_;
@@ -42,6 +27,26 @@ private:
 
     bool pop_task(size_t idx, std::function<void()>& task);
 };    
+
+template<typename F, typename... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args) -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>> {
+    using return_type = std::invoke_result_t<F, Args...>;
+
+    auto task = std::make_shared<std::packaged_task<return_type()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+    );
+
+    auto wrapper = [task]() { (*task)(); };
+    
+    size_t i = std::hash<std::thread::id>{}(std::this_thread::get_id()) % queues_.size();
+    {
+        std::unique_lock<std::mutex> lock(queueMutex_);
+        if (stop_) throw std::runtime_error("enqueue on stopped ThreadPool");
+        queues_[i].push_back(std::move(wrapper));
+    }
+    condition_.notify_one();
+    return task->get_future();
+}
 
 ThreadPool::ThreadPool(size_t numThreads) : stop_(false) {
     workers_.resize(numThreads);
@@ -61,6 +66,10 @@ ThreadPool::ThreadPool(size_t numThreads) : stop_(false) {
             }
         });
     }
+}
+
+int ThreadPool::size() {
+    return workers_.size();
 }
 
 ThreadPool::~ThreadPool() {
