@@ -42,7 +42,7 @@ struct AsyncTask {
 
     bool is_ready() const { return coro.done(); }
 
-    // Custom overload of co_await operator when the 
+    // Custom overload of co_await operator 
     auto operator co_await() {
         struct Awaiter {
             std::coroutine_handle<promise_type> coro;
