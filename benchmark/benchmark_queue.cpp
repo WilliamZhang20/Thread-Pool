@@ -4,7 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <cassert>
-#include "LockFreeQueue.h"
+#include "../LockFreeQueue.h"
 
 // --- Benchmark Harness ---
 int main() {

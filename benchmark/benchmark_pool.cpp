@@ -1,6 +1,6 @@
 #include <iostream>
 #include <chrono>
-#include "ThreadPool.h"
+#include "../ThreadPool.h"
 
 int main() {
     constexpr size_t NUM_TASKS = 1'000'000; // 1M tasks
