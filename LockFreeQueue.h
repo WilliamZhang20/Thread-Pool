@@ -20,6 +20,25 @@ public:
         }
     }
 
+    LockFreeQueue(const LockFreeQueue&) = delete;
+    LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+
+    LockFreeQueue(LockFreeQueue&& other) noexcept
+        : buffer(std::move(other.buffer)),
+        capacity(other.capacity),
+        head(other.head.load()),
+        tail(other.tail.load()) {}
+
+    LockFreeQueue& operator=(LockFreeQueue&& other) noexcept {
+        if (this != &other) {
+            buffer = std::move(other.buffer);
+            capacity = other.capacity;
+            head.store(other.head.load());
+            tail.store(other.tail.load());
+        }
+        return *this;
+    }
+
     bool enqueue(const T& item) {
         size_t t = tail.load(std::memory_order_relaxed);
         size_t h = head.load(std::memory_order_acquire);
@@ -41,7 +60,7 @@ public:
             return false; // empty
         }
 
-        item = buffer[h]; // assign buffer element to reference
+        item = buffer[h]; // assign buffer element to
         head.store((h + 1) & (capacity - 1), std::memory_order_release);
         return true;
     }

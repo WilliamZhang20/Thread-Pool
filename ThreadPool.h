@@ -4,15 +4,21 @@
 #include <functional>
 #include <atomic>
 #include <stdexcept>
+#include <future>
 #include "LockFreeQueue.h"
 
 class ThreadPool {
 public:
     using Task = std::function<void()>;
 
-    explicit ThreadPool(size_t numThreads, size_t queueCapacity = 1024)
+    explicit ThreadPool(size_t numThreads = std::thread::hardware_concurrency(),
+                    size_t queueCapacity = 1024)
         : stopFlag(false) 
     {
+        if (numThreads == 0) {
+            numThreads = 1; // fallback in case hardware_concurrency() returns 0
+        }
+
         if ((queueCapacity & (queueCapacity - 1)) != 0) {
             throw std::runtime_error("Queue capacity must be power of 2");
         }
@@ -22,7 +28,6 @@ public:
             queues.emplace_back(queueCapacity);
         }
 
-        // spawn worker threads
         for (size_t i = 0; i < numThreads; ++i) {
             workers.emplace_back([this, i]() { this->workerLoop(i); });
         }
@@ -33,12 +38,24 @@ public:
     }
 
     // submit a task: pick a queue (round robin here)
-    void submit(Task task) {
+    template<class F, class... Args>
+    auto submit(F&& f, Args&&... args)
+        -> std::future<typename std::invoke_result<F, Args...>::type>
+    {
+        using return_type = typename std::invoke_result<F, Args...>::type;
+
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+
+        std::future<return_type> res = task->get_future();
+
         size_t idx = rrIndex.fetch_add(1, std::memory_order_relaxed) % queues.size();
-        while (!queues[idx].enqueue(std::move(task))) {
-            // queue full → spin or yield
+        while (!queues[idx].enqueue([task]() { (*task)(); })) {
             std::this_thread::yield();
         }
+
+        return res;
     }
 
     void stop() {
