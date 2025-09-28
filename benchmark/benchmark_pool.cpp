@@ -3,7 +3,7 @@
 #include "../ThreadPool.h"
 
 int main() {
-    constexpr size_t NUM_TASKS = 1'000'000; // 1M tasks
+    constexpr size_t NUM_TASKS = 10'000'000; // 10M tasks
     ThreadPool pool; // uses hardware_concurrency threads
 
     std::vector<std::future<int>> results;
