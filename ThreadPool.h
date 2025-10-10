@@ -87,6 +87,7 @@ private:
         Task task;
         while (!stopFlag.load(std::memory_order_acquire)) {
             if (q.dequeue(task)) {
+                std::cout << "Executing a task\n";
                 task();  // Execute the task
             } else {
                 // Queue empty → yield to avoid busy-waiting
