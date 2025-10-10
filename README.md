@@ -1,41 +1,28 @@
-# Thread Pool
+# Task Execution Engine
 
-In this project, I built a thread pool in C++ with `std::thread`, and added handling for inter-dependent tasks using C++ [coroutines](https://www.scs.stanford.edu/~dm/blog/c++-coroutines.html),
+This project is a custom task execution library in C++, consisting of a thread pool and task scheduler.
 
-## Background
+It also happens that a similar system is an upcoming feature in [C++26](https://en.cppreference.com/w/cpp/execution.html), so it is interesting to try implementing the idea from scratch.
 
-Computing the nth Fibonacci using fork-join parallelism is a classic example of a parallel algorithm. But if a thread is created at each level of recursion and n were to be huge, the computer would simply crash at some point.
+## Getting Started
 
-So, I created a thread pool inside the file `ThreadPool.h` to allow a program to run many tasks on a limited number of threads, with any type of function (even variadic arguments!), and a simple interface. 
+The files in the home directory contain the components of the scheduler:
+1. Lock-Free Queue to handle each processor's workload
+2. Thread Pool with automatically optimized number of workers with `std::thread::hardware_concurrency()`. This number of workers is a balance between the number of physical cores and the total number of hardware threads. Each worker has a task queue and can steal from others to balance workload.
+3. Graph scheduler for dependent tasks, applying the thread pool to universal usage. The user can just set dependencies between task handles and the scheduler will handle them.
 
-Moreover, the size of the pool is automatically optimized using the C++ `std::thread::hardware_concurrency()` which returns the number of logical processors. This is not necessarily the number of cores, since a single hardware core may include multiple execution contexts.
+## Profiling Results
 
-However, the pool does not work with a Fibonacci calculation working like this:
+The `test` directory contains benchmarks to stress test the scheduler, which are run inside Intel VTune profiler to assess hardware footprint and usage.
 
-```C++
-int fibonacci(int n) {
-  auto res = pool.enqueue(fibonacci, n-1);
-  return res.get() + fibonacci(n-2);
-}
-```
-This is because the root function of any Fibonacci recursion tree sits in the pool until it is done, which occurs when all its children are done. But if the height of the recursion tree is massive, so big it's too big for the thread pool, then a deadlock will result. 
+The latest thread pool test yields 85% logical core usage.
 
-Why? The root has to finish by waiting for the leaf, but the leaf can't run till some other thread finishes running, all of which are often higher than the leaf. But those higher functions are waiting for the task sitting in the queue to run. They're waiting for each other, hence the deadlock.
+## Previous Iterations
 
-while I didn't try memoizing Fibonacci, I believe a deadlock would have occured either way, since a bigger value would have led to many leaf calculations.
+The project is in its third iteration. The previous ones were:
+1. A simple thread pool with a global queue to process groups of independent tasks in parallel.
+2. A solution to handle task dependencies with C++20 [coroutines](https://www.scs.stanford.edu/~dm/blog/c++-coroutines.html).
 
-At first, I tried to reverse the queue to a stack so leaf functions ran earlier. Didn't help. Still deadlocked, although a little later. Then I tried prioritizing tasks, which was also insanely hard and never worked.
+The first iteration could not handle dependent tasks.
 
-Then I realized that parent functions had to be able to exit the execution context to allow the recursive calls to run in the pool. In other words, they had to suspend. So I searched for quite a long time for such things, and found the solution in...coroutines!
-
-## The Solution
-
-Coroutines were introduced in C++20, and allow for suspension & resumption of execution. They are also more lightweight than threads as they are not managed by the OS, so suspensions incur less overhead.
-
-Execution states are saved in the heap when suspended and are managed by coroutine handles that point to the context. 
-
-The coroutine handle, of which there will be multiple for thread pools, is stored in a coroutine type (that is user-defined) that provides an interface to call coroutines.
-
-Nested within the coroutine type is the promise type, that represents the coroutine state that is changed with calls to operators such as `co_await`, `co_yield`, and `co_return`.
-
-More notes are to be continued. 
+The second iteration's performance efficiency was bad. The heavy context switching through `co_await` and `co_return` operations between threads significantly degraded performance in comparison to the sequential alternative.
