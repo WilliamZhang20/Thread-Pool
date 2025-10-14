@@ -1,201 +1,222 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
-#include <memory>
-#include <optional>
-#include <vector>
 #include <cassert>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <optional>
+#include <type_traits>
 #include <utility>
-// Based on the classic Chase-Lev work-stealing deque design.
-// Notes:
-//  - Only one thread (the "owner") should call push_bottom/pop_bottom.
-//  - Many other threads may concurrently call steal_top.
-//  - The implementation grows the circular buffer when needed; growth is performed
-//    by the owner only (so no expensive synchronization needed for resizing).
+#include <vector>
+
+// This (stand-alone) file implements the deque described in the papers, "Correct and Efficient
+// Work-Stealing for Weak Memory Models," and "Dynamic Circular Work-Stealing Deque". Both are
+// available in 'reference/'.
+
+namespace TaskStore {
 
 template <typename T>
-class LockFreeDeque {
-private:
-    struct buffer {
-        size_t capacity;  // power of two
-        std::aligned_storage_t<sizeof(T), alignof(T)> *data;  // Aligned raw storage
-        buffer(size_t cap)
-            : capacity(cap), data(static_cast<std::aligned_storage_t<sizeof(T), alignof(T)>*>(operator new[](sizeof(std::aligned_storage_t<sizeof(T), alignof(T)>) * cap))) {}
+concept Simple = std::default_initializable<T> && std::is_trivially_destructible_v<T>;
 
-        ~buffer() {
-            operator delete[](data);
+namespace detail {
+
+    // Basic wrapper around a c-style array of atomic objects that provides modulo load/stores. Capacity
+    // must be a power of 2.
+    template <Simple T> struct RingBuff {
+      public:
+        explicit RingBuff(std::int64_t cap) : _cap{cap}, _mask{cap - 1} {
+            assert(cap && (!(cap & (cap - 1))) && "Capacity must be buf power of 2!");
         }
+
+        std::int64_t capacity() const noexcept { return _cap; }
+
+        // Store (copy) at modulo index
+        void store(std::int64_t i, T&& x) noexcept requires std::is_nothrow_move_assignable_v<T> {
+            _buff[i & _mask] = std::move(x);
+        }
+
+        // Load (copy) at modulo index
+        T load(std::int64_t i) const noexcept requires std::is_nothrow_move_constructible_v<T> {
+            return _buff[i & _mask];
+        }
+
+        // Allocates and returns a new ring buffer, copies elements in range [b, t) into the new buffer.
+        RingBuff<T>* resize(std::int64_t b, std::int64_t t) const {
+            RingBuff<T>* ptr = new RingBuff{2 * _cap};
+            for (std::int64_t i = t; i != b; ++i) {
+                ptr->store(i, load(i));
+            }
+            return ptr;
+        }
+
+      private:
+        std::int64_t _cap;   // Capacity of the buffer
+        std::int64_t _mask;  // Bit mask to perform modulo capacity operations
+
+        std::unique_ptr<T[]> _buff = std::make_unique_for_overwrite<T[]>(_cap);
     };
 
-    std::atomic<size_t> top;
-    std::atomic<size_t> bottom;
+}  // namespace detail
 
-    // Buffer pointer is only updated by owner; thieves only read it.
-    std::atomic<buffer*> buf;
+#ifdef __cpp_lib_hardware_interference_size
+using std::hardware_destructive_interference_size;
+#else
+// 64 bytes on x86-64 │ L1_CACHE_BYTES │ L1_CACHE_SHIFT │ __cacheline_aligned │ ...
+inline constexpr std::size_t hardware_destructive_interference_size = 2 * sizeof(std::max_align_t);
+#endif
 
-    static size_t next_pow2(size_t n) {
-        size_t p = 1;
-        while (p < n) p <<= 1;
-        return p;
-    }
+// Lock-free single-producer multiple-consumer deque. Only the deque owner can perform pop and push
+// operations where the deque behaves like a stack. Others can (only) steal data from the deque, they see
+// a FIFO queue. All threads must have finished using the deque before it is destructed. T must be
+// default initializable, trivially destructible and have nothrow move constructor/assignment operators.
+template <Simple T> class Deque {
+  public:
+    // Constructs the deque with a given capacity the capacity of the deque (must be power of 2)
+    explicit Deque(std::int64_t cap = 1024);
 
-    // Owner-only: grow the buffer when it's full
-    void grow(buffer *old) {
-        size_t oldcap = old->capacity;
-        size_t newcap = oldcap << 1;
-        buffer *b = new buffer(newcap);
+    // Move/Copy is not supported
+    Deque(Deque const& other) = delete;
+    Deque& operator=(Deque const& other) = delete;
 
-        // Copy current valid elements [top, bottom)
-        size_t t = top.load(std::memory_order_acquire);
-        size_t btm = bottom.load(std::memory_order_relaxed);
-        size_t sz = btm - t;
-        for (size_t i = 0; i < sz; ++i) {
-            // Use placement new to copy
-            new (&b->data[i]) T(std::move(reinterpret_cast<T&>(old->data[( (t + i) & (oldcap - 1) )]))); 
-        }
-        // Publish new buffer
-        buf.store(b, std::memory_order_release);
+    //  Query the size at instance of call
+    std::size_t size() const noexcept;
 
-        // Adjust indices: set top = 0, bottom = sz to match copied layout
-        top.store(0, std::memory_order_release);
-        bottom.store(sz, std::memory_order_release);
+    // Query the capacity at instance of call
+    int64_t capacity() const noexcept;
 
-        // Delete old buffer
-        delete old;
-    }
+    // Test if empty at instance of call
+    bool empty() const noexcept;
 
-public:
-    LockFreeDeque(size_t initial_capacity = 1024) {
-        size_t c = next_pow2(std::max<size_t>(2, initial_capacity));
-        buffer *b = new buffer(c);
-        buf.store(b, std::memory_order_release);
-        top.store(0, std::memory_order_relaxed);
-        bottom.store(0, std::memory_order_relaxed);
-    }
+    // Emplace an item to the deque. Only the owner thread can insert an item to the deque. The
+    // operation can trigger the deque to resize its cap if more space is required. Provides the
+    // strong exception guarantee.
+    template <typename... Args> void emplace(Args&&... args);
 
-    ~LockFreeDeque() {
-        buffer *b = buf.load(std::memory_order_relaxed);
-        if (!b) return;
-        size_t t = top.load(std::memory_order_relaxed);
-        size_t btm = bottom.load(std::memory_order_relaxed);
-        size_t cap = b->capacity;
-        if (btm > t) {
-            for (size_t i = t; i < btm; ++i) {
-                size_t idx = i & (cap - 1);
-                std::launder(reinterpret_cast<T*>(&b->data[idx]))->~T();
-            }
-        }
-        delete b;
-    }
+    // Pops out an item from the deque. Only the owner thread can pop out an item from the deque.
+    // The return can be a std::nullopt if this operation fails (empty deque).
+    std::optional<T> pop() noexcept;
 
-    LockFreeDeque(const LockFreeDeque&) = delete;
-    LockFreeDeque& operator=(const LockFreeDeque&) = delete;
+    // Steals an item from the deque Any threads can try to steal an item from the deque. The return
+    // can be a std::nullopt if this operation failed (not necessarily empty).
+    std::optional<T> steal() noexcept;
 
-    LockFreeDeque(LockFreeDeque&& other) noexcept {
-        top.store(other.top.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        bottom.store(other.bottom.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        buf.store(other.buf.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        other.buf.store(nullptr, std::memory_order_relaxed);
-    }
+    // Destruct the deque, all threads must have finished using the deque.
+    ~Deque() noexcept;
 
-    LockFreeDeque& operator=(LockFreeDeque&& other) noexcept {
-        if (this != &other) {
-            // Free current buffer if any
-            auto old = buf.load(std::memory_order_relaxed);
-            delete old;
+  private:
+    alignas(hardware_destructive_interference_size) std::atomic<std::int64_t> _top;
+    alignas(hardware_destructive_interference_size) std::atomic<std::int64_t> _bottom;
+    alignas(hardware_destructive_interference_size) std::atomic<detail::RingBuff<T>*> _buffer;
 
-            top.store(other.top.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            bottom.store(other.bottom.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            buf.store(other.buf.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            other.buf.store(nullptr, std::memory_order_relaxed);
-        }
-        return *this;
-    }
+    std::vector<std::unique_ptr<detail::RingBuff<T>>> _garbage;  // Store old buffers here.
 
-    void push_bottom(T item) {
-        size_t btm = bottom.load(std::memory_order_relaxed);
-        size_t t = top.load(std::memory_order_acquire);
-        buffer *cbuf = buf.load(std::memory_order_acquire);
-        size_t cap = cbuf->capacity;
-
-        if (btm - t >= cap - 1) {
-            grow(cbuf);
-            cbuf = buf.load(std::memory_order_acquire);
-            cap = cbuf->capacity;
-            btm = bottom.load(std::memory_order_relaxed);
-        }
-
-        size_t idx = btm & (cap - 1);
-        // Use placement new to construct the object
-        new (&cbuf->data[idx]) T(std::move(item));
-        bottom.store(btm + 1, std::memory_order_release);
-    }
-
-    // Owner thread: pop from bottom. Returns std::nullopt when empty.
-    std::optional<T> pop_bottom() {
-        size_t b = bottom.load(std::memory_order_relaxed);
-        size_t t = top.load(std::memory_order_acquire);
-        if (b <= t) {
-            return std::nullopt;
-        }
-
-        size_t new_b = b - 1;
-        bottom.store(new_b, std::memory_order_release);
-
-        t = top.load(std::memory_order_acquire);  // Reload after store
-        if (new_b < t) {
-            bottom.store(b, std::memory_order_relaxed);  // Restore
-            return std::nullopt;
-        }
-
-        buffer *cbuf = buf.load(std::memory_order_acquire);
-        size_t cap = cbuf->capacity;
-        size_t idx = new_b & (cap - 1);
-        T* ptr = reinterpret_cast<T*>(&cbuf->data[idx]);
-        T result = std::move(*ptr);
-        ptr->~T();
-
-        return std::make_optional<T>(std::move(result));
-    }
-
-    // Thief thread(s): steal from top. Returns std::nullopt if empty / failed.
-    std::optional<T> steal_top() {
-        size_t t = top.load(std::memory_order_acquire);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        size_t btm = bottom.load(std::memory_order_acquire);
-
-        if (t >= btm) {
-            // Empty
-            return std::nullopt;
-        }
-
-        buffer *cbuf = buf.load(std::memory_order_acquire);
-        size_t cap = cbuf->capacity;
-        size_t idx = t & (cap - 1);
-
-        T *ptr = reinterpret_cast<T*>(&cbuf->data[idx]);
-        T result = std::move(*ptr);
-
-        // Attempt to CAS top forward
-        size_t expected = t;
-        if (top.compare_exchange_strong(expected, t + 1,
-                                        std::memory_order_seq_cst,
-                                        std::memory_order_relaxed)) {
-            // Success: we logically stole the element; destroy in place and return
-            ptr->~T();
-            return std::make_optional<T>(std::move(result));
-        } else {
-            // Someone else (another thief or owner) raced; failed to steal
-            *ptr = std::move(result);
-            return std::nullopt;
-        }
-    }
-
-    // Approximate size
-    size_t size_approx() const {
-        size_t t = top.load(std::memory_order_acquire);
-        size_t btm = bottom.load(std::memory_order_acquire);
-        return (btm >= t) ? (btm - t) : 0;
-    }
+    // Convenience aliases.
+    static constexpr std::memory_order relaxed = std::memory_order_relaxed;
+    static constexpr std::memory_order consume = std::memory_order_consume;
+    static constexpr std::memory_order acquire = std::memory_order_acquire;
+    static constexpr std::memory_order release = std::memory_order_release;
+    static constexpr std::memory_order seq_cst = std::memory_order_seq_cst;
 };
+
+template <Simple T> Deque<T>::Deque(std::int64_t cap)
+    : _top(0), _bottom(0), _buffer(new detail::RingBuff<T>{cap}) {
+    _garbage.reserve(32);
+}
+
+template <Simple T> std::size_t Deque<T>::size() const noexcept {
+    int64_t b = _bottom.load(relaxed);
+    int64_t t = _top.load(relaxed);
+    return static_cast<std::size_t>(b >= t ? b - t : 0);
+}
+
+template <Simple T> int64_t Deque<T>::capacity() const noexcept {
+    return _buffer.load(relaxed)->capacity();
+}
+
+template <Simple T> bool Deque<T>::empty() const noexcept { return !size(); }
+
+template <Simple T> template <typename... Args> void Deque<T>::emplace(Args&&... args) {
+    // Construct before acquiring slot in-case constructor throws
+    T object(std::forward<Args>(args)...);
+
+    std::int64_t b = _bottom.load(relaxed);
+    std::int64_t t = _top.load(acquire);
+    detail::RingBuff<T>* buf = _buffer.load(relaxed);
+
+    if (buf->capacity() < (b - t) + 1) {
+        // Queue is full, build a new one
+        _garbage.emplace_back(std::exchange(buf, buf->resize(b, t)));
+        _buffer.store(buf, relaxed);
+    }
+
+    // Construct new object, this does not have to be atomic as no one can steal this item until after we
+    // store the new value of bottom, ordering is maintained by surrounding atomics.
+    buf->store(b, std::move(object));
+
+    std::atomic_thread_fence(release);
+    _bottom.store(b + 1, relaxed);
+}
+
+template <Simple T> std::optional<T> Deque<T>::pop() noexcept {
+    std::int64_t b = _bottom.load(relaxed) - 1;
+    detail::RingBuff<T>* buf = _buffer.load(relaxed);
+
+    _bottom.store(b, relaxed);  // Stealers can no longer steal
+
+    std::atomic_thread_fence(seq_cst);
+    std::int64_t t = _top.load(relaxed);
+
+    if (t <= b) {
+        // Non-empty deque
+        if (t == b) {
+            // The last item could get stolen, by a stealer that loaded bottom before our write above
+            if (!_top.compare_exchange_strong(t, t + 1, seq_cst, relaxed)) {
+                // Failed race, thief got the last item.
+                _bottom.store(b + 1, relaxed);
+                return std::nullopt;
+            }
+            _bottom.store(b + 1, relaxed);
+        }
+
+        // Can delay load until after acquiring slot as only this thread can push(), this load is not
+        // required to be atomic as we are the exclusive writer.
+        return buf->load(b);
+
+    } else {
+        _bottom.store(b + 1, relaxed);
+        return std::nullopt;
+    }
+}
+
+template <Simple T> std::optional<T> Deque<T>::steal() noexcept {
+    std::int64_t t = _top.load(acquire);
+    std::atomic_thread_fence(seq_cst);
+    std::int64_t b = _bottom.load(acquire);
+
+    if (t < b) {
+        // Must load *before* acquiring the slot as slot may be overwritten immediately after acquiring.
+        // This load is NOT required to be atomic even-though it may race with an overrite as we only
+        // return the value if we win the race below garanteeing we had no race during our read. If we
+        // loose the race then 'x' could be corrupt due to read-during-write race but as T is trivially
+        // destructible this does not matter.
+        T x = _buffer.load(consume)->load(t);
+
+        if (!_top.compare_exchange_strong(t, t + 1, seq_cst, relaxed)) {
+            // Failed race.
+            return std::nullopt;
+        }
+
+        return x;
+
+    } else {
+        // Empty deque.
+        return std::nullopt;
+    }
+}
+
+template <Simple T> Deque<T>::~Deque() noexcept { delete _buffer.load(); }
+
+}  // namespace TaskStore
